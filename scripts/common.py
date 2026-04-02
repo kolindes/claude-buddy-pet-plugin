@@ -31,7 +31,7 @@ CLAUDE_CONFIG_FILE = os.path.expanduser("~/.claude.json")
 # API URL
 # ---------------------------------------------------------------------------
 
-_DEFAULT_API_URL = "http://localhost:10080"
+_DEFAULT_API_URL = "https://guild.claude-buddy.pet"
 
 
 def get_api_url():

@@ -8,50 +8,15 @@ Reads JSONL transcript, extracts assistant events, sends feeding batches.
 
 import fcntl
 import json
-import math
 import os
 import sys
 import time
-import urllib.request
 
 # Add scripts dir to path for common import
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common
 
-HEARTBEAT_INTERVAL = 30  # seconds (30 for testing, 300 for prod)
-
-LOG_FILE = os.path.join(common.PLUGIN_DATA, "feeder.log")
-LOKI_URL = os.environ.get("LOKI_URL", "http://localhost:3100")
-
-
-def _log(msg):
-    """Log to local file + push to Loki (best-effort)."""
-    ts = time.strftime('%H:%M:%S')
-    # Always write to local file
-    try:
-        os.makedirs(common.PLUGIN_DATA, exist_ok=True)
-        with open(LOG_FILE, "a") as f:
-            f.write(f"{ts} {msg}\n")
-    except OSError:
-        pass
-    # Push to Loki (fire-and-forget, never blocks feeder)
-    try:
-        ns = str(int(time.time() * 1e9))
-        payload = json.dumps({
-            "streams": [{
-                "stream": {"service": "feeder", "job": "buddy-sn-plugin"},
-                "values": [[ns, f"{ts} {msg}"]]
-            }]
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            LOKI_URL + "/loki/api/v1/push",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=2)
-    except Exception:
-        pass  # Never fail the feeder because of logging
+HEARTBEAT_INTERVAL = 300  # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -71,10 +36,9 @@ def _auto_birth():
     """Auto-register buddy for the current account. Returns config or None."""
     user_id = common.get_user_id()
     if user_id == "anon":
-        _log("auto-birth: userId=anon, skip")
+
         return None
 
-    _log("auto-birth: registering buddy...")
 
     user_hash = common.compute_user_hash(user_id)
     instance_id = common.compute_instance_id()
@@ -109,13 +73,11 @@ def _auto_birth():
     status, resp = common.http_post("/guild/buddy/birth", birth_data)
 
     if status not in (200, 201):
-        _log(f"auto-birth: failed HTTP {status}: {resp}")
         return None
 
     token = resp.get("buddy_token", "")
     buddy_id = resp.get("buddy_id", "")
     if not token:
-        _log(f"auto-birth: no token in response: {resp}")
         return None
 
     config = {
@@ -126,7 +88,6 @@ def _auto_birth():
     common.save_config(config)
 
     name = resp.get("buddy", {}).get("name", buddy_id[:8])
-    _log(f"auto-birth: OK — {name} ({buddy_id})")
     return config
 
 
@@ -135,7 +96,6 @@ def main():
         sys.exit(0)
 
     mode = sys.argv[1]
-    _log(f"--- {mode} ---")
 
     if mode == "start":
         do_start()
@@ -176,7 +136,6 @@ def do_heartbeat():
 
     hook_input = _read_hook_input()
     if not hook_input:
-        _log("heartbeat: no hook_input, skip")
         return
 
     state = common.load_state()
@@ -185,10 +144,8 @@ def do_heartbeat():
     now = time.time()
     elapsed = now - state.get("last_send_time", 0)
     if elapsed < HEARTBEAT_INTERVAL:
-        _log(f"heartbeat: {elapsed:.0f}s < {HEARTBEAT_INTERVAL}s, skip")
         return
 
-    _log(f"heartbeat: {elapsed:.0f}s elapsed, sending...")
     _send_events(config, hook_input, state)
 
 
@@ -205,10 +162,8 @@ def do_flush():
 
     hook_input = _read_hook_input()
     if not hook_input:
-        _log("flush: no hook_input, skip")
         return
 
-    _log("flush: sending all remaining events")
 
     state = common.load_state()
     _send_events(config, hook_input, state)
@@ -226,13 +181,11 @@ def _send_events(config, hook_input, state):
     cwd = hook_input.get("cwd", "")
 
     if not transcript_path or not os.path.isfile(transcript_path):
-        _log(f"send: no transcript at {transcript_path}")
         return
 
     # Acquire file lock (non-blocking)
     lock_fd = _acquire_lock()
     if lock_fd is None:
-        _log("send: lock held by another process")
         return
 
     try:
@@ -248,7 +201,6 @@ def _send_events(config, hook_input, state):
         events, new_offset = _read_jsonl_events(transcript_path, offset)
 
         if not events:
-            _log(f"send: no new events (offset={offset})")
             return
 
         # Check companion sync
@@ -258,7 +210,6 @@ def _send_events(config, hook_input, state):
             companion_data = common.read_companion_data()
             if companion_data:
                 companion_sync = companion_data
-                _log("send: companion sync included (hash changed)")
 
         # Build payload
         batch_seq = int(time.time())
@@ -272,19 +223,15 @@ def _send_events(config, hook_input, state):
         }
 
         # POST /feeding
-        _log(f"send: POST /feeding {len(events)} events, offset {offset}->{new_offset}")
         status, resp = common.http_post("/feeding", payload, token=config["buddy_token"])
-        _log(f"send: HTTP {status} → {resp}")
 
         if status == 401:
             # Token invalid — re-register and retry once
-            _log("send: 401 — token invalid, re-registering")
             common.delete_config()
             new_config = _auto_birth()
             if new_config:
                 payload["session_hash"] = common.compute_session_hash(session_id)
                 status, resp = common.http_post("/feeding", payload, token=new_config["buddy_token"])
-                _log(f"send: retry HTTP {status} → {resp}")
 
         if status in (202, 409):
             # Success or duplicate — update state
@@ -298,7 +245,6 @@ def _send_events(config, hook_input, state):
             common.save_state(state)
         elif status != 401:
             # Non-auth failure — save to pending for retry
-            _log(f"send: HTTP {status} non-success, saving to pending")
             _save_pending(payload)
 
     finally:
@@ -476,9 +422,6 @@ def submit_pending(token):
         return
 
     pending_json = [f for f in files if f.endswith(".json")]
-    if pending_json:
-        _log(f"pending: {len(pending_json)} files to retry")
-
     for fname in pending_json:
         fpath = os.path.join(common.PENDING_DIR, fname)
         try:
@@ -489,14 +432,13 @@ def submit_pending(token):
 
         status, _resp = common.http_post("/feeding", payload, token=token)
         if status in (202, 409):
-            _log(f"pending: sent {fname} (HTTP {status})")
             # Sent or duplicate — remove
             try:
                 os.remove(fpath)
             except OSError:
                 pass
         else:
-            _log(f"pending: retry failed {fname} (HTTP {status})")
+            _save_pending(payload)
 
 
 def _save_pending(payload):

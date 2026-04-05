@@ -204,11 +204,6 @@ def http_patch(path, data, token=None):
 _BUDDY_SALT = "buddy-sn-salt"
 
 
-def compute_token_hash(token):
-    """SHA-256 hex hash of a token string."""
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
 def compute_instance_id():
     """SHA-256 of hostname + username + plugin_data_dir."""
     hostname = socket.gethostname()
